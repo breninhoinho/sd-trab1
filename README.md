@@ -32,7 +32,7 @@ python broker.py broker2 5600
 python broker.py broker3 5700
 ```
 
-### 2. Inicie clientes conectando a diferentes brokers
+### 2. Inicie clientes 
 
 ```bash
 # Terminal 4 - Cliente no Broker1
@@ -184,18 +184,3 @@ Formato do heartbeat UDP:
 pip install pyzmq opencv-python pillow
 # Opcional: pip install pyaudio
 ```
-
-## Troubleshooting
-
-### Broker não descobre outros brokers
-- Verifique se está usando localhost ou mesmo IP
-- Confirme que UDP porta 6000 não está bloqueada
-
-### Cliente não conecta ao broker
-- Confirme que o broker_port está correto
-- Verifique se o broker está rodando com aquela porta primária
-
-### Mensagens não chegam entre brokers
-- Verifique a sala/grupo nas mensagens
-- Confirme que os brokers conseguem se comunicar na porta 6000
-
