@@ -1,0 +1,5 @@
+numpy==2.2.6
+opencv-python==4.13.0.92
+pillow==12.2.0
+PyAudio==0.2.14
+pyzmq==27.1.0
