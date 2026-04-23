@@ -1,186 +1,146 @@
-# VideoConf - Arquitetura Multi-Broker com Service Discovery
+# VideoConf Distribuido com ZeroMQ
+
+Projeto de videoconferencia (video, audio e texto) em Python3 com arquitetura distribuida baseada em ZeroMQ.
+
+## Objetivo da evolucao
+
+Esta versao implementa:
+
+- multiplos brokers cooperando
+- descoberta dinamica de brokers (service discovery)
+- tolerancia a falhas com failover automatico
+- QoS simplificado por tipo de midia
+- concorrencia com threads separadas
+- identidade, sessao, presenca e salas
 
 ## Arquitetura
 
-Sistema de videoconferência distribuído com múltiplos brokers que se descobrem via UDP heartbeat. Cada broker gerencia um subconjunto de usuários/grupos e roteia mensagens inteligentemente evitando loops.
+### 1) Cluster de brokers
 
-### Componentes
+Cada broker executa de forma independente e publica heartbeat por UDP.
 
-1. **Brokers**: Instâncias independentes com diferentes portas
-   - Service discovery via UDP heartbeat (porta fixa 6000)
-   - ROUTER-DEALER para cada canal (vídeo, áudio, texto)
-   - Roteamento inteligente entre brokers
-   - Gerenciamento de grupos/salas locais
+- descoberta: UDP porta `6000`
+- plano de dados cliente/broker por canal (XSUB/XPUB):
+  - video: `P+3` (pub_in), `P+4` (sub_out)
+  - audio: `P+13` (pub_in), `P+14` (sub_out)
+  - texto: `P+23` (pub_in), `P+24` (sub_out)
+- plano de controle (REQ/REP): `P+200`
+- malha inter-broker (PUB/SUB): `P+300`
 
-2. **Clientes**: Conectam a um broker específico
-   - Enviam sala/grupo em cada mensagem
-   - Registram-se no broker ao entrar
-   - Recebem dados via PUB-SUB broadcast
+### 2) Roteamento inter-broker e anti-loop
 
-## Como Usar
+Mensagens de midia recebidas localmente sao:
 
-### 1. Inicie múltiplos brokers
+1. entregues aos assinantes locais
+2. reenviadas para outros brokers via malha
 
-```bash
-# Terminal 1 - Broker 1 (porta primária 5500)
-python broker.py broker1 5500
+Cada relay inclui metadados com:
 
-# Terminal 2 - Broker 2 (porta primária 5600)
-python broker.py broker2 5600
+- `msg_id` unico
+- `origin_broker`
+- `ttl`
 
-# Terminal 3 - Broker 3 (porta primária 5700)
-python broker.py broker3 5700
-```
+Loop e duplicacao sao evitados por cache de mensagens ja vistas + TTL decremental.
 
-### 2. Inicie clientes 
+### 3) Service discovery
 
-```bash
-# Terminal 4 - Cliente no Broker1
-python client.py 
+Cliente nao precisa conhecer broker fixo.
 
-# Terminal 5 - Cliente no Broker2
-python client.py 
+- brokers se anunciam por heartbeat UDP
+- cliente escolhe broker por:
+  - menor latencia
+  - round-robin
 
-# Terminal 6 - Outro cliente no Broker1
-python client.py 
-```
+### 4) Tolerancia a falhas
 
-## Estrutura de Portas
+Cliente possui monitor de heartbeat (ping no controle):
 
-Para cada broker com `primary_port = P`:
+- se broker falha por 3 tentativas consecutivas
+- cliente faz failover automatico para outro broker descoberto
+- sessao e sala sao restabelecidas no novo broker
 
-### VÍDEO
-- ROUTER (cliente → broker): `P + 1`
-- DEALER (distribuição interna): `P + 2`
-- XSUB (recebe PUB): `P + 3`
-- XPUB (publica SUB): `P + 4`
+### 5) QoS simplificado
 
-### ÁUDIO
-- ROUTER: `P + 11`
-- DEALER: `P + 12`
-- XSUB: `P + 13`
-- XPUB: `P + 14`
+- Texto (garantia de entrega): envio via plano de controle com `text_id` + retry ate 3 tentativas no cliente
+- Audio (baixa latencia): buffer pequeno com drop de chunks antigos quando fila enche
+- Video (taxa adaptativa): ajuste de qualidade JPEG conforme backlog e drop de frames antigos no buffer
 
-### TEXTO
-- ROUTER: `P + 21`
-- DEALER: `P + 22`
-- XSUB: `P + 23`
-- XPUB: `P + 24`
+### 6) Concorrencia (threads)
 
-### Service Discovery
-- UDP Broadcast: Porta `6000` (fixa em todos os brokers)
+Cliente separa explicitamente:
 
-### Inter-Broker Communication
-- REP Server: `P + 100` (roteamento entre brokers)
+- captura de video
+- envio de video
+- recepcao de video
+- captura de audio
+- envio de audio
+- recepcao de audio
+- recepcao de texto
+- monitoramento de heartbeat/failover
+- renderizacao (loop UI)
 
-## Fluxo de Mensagens
+### 7) Identidade, sessao, presenca e salas
 
-### Publish (Vídeo/Áudio/Texto)
-```
-Cliente A (sala: "geral")
-    ↓
-    ├→ REQ para ROUTER (notificação)
-    └→ PUB para XSUB (dados)
-         ↓
-         Broker (gerencia sala "geral")
-         ↓
-         XPUB → SUB clientes da sala
-```
-
-### Roteamento Inter-Broker
-```
-Cliente A no Broker1 (sala: "geral")
-    ↓
-Broker1 (sala "geral" não está aqui)
-    ↓
-    Envia para Broker2 e Broker3
-    ↓
-Broker2 tem sala "geral"
-    ↓
-    Roteia para Cliente B
-```
-
-### Prevenção de Loops
-```
-Broker1 recebe mensagem com origem_broker = "Broker1"
-    ↓
-    Bloqueia reencaminhamento (já veio daqui)
-    ↓
-    Apenas roteia para clientes locais
-```
-
-## Protocolo de Mensagens
-
-### Registrar Usuário
-```json
-{
-    "tipo": "registrar",
-    "usuario": "joão",
-    "sala": "geral",
-    "broker_id": "broker1"
-}
-```
-
-### Frame (Vídeo/Áudio/Texto)
-```json
-{
-    "tipo": "frame",
-    "stream": "video|audio|texto",
-    "sala": "geral",
-    "usuario": "joão",
-    "broker_origem": "broker1",
-    "timestamp": 1234567890.123,
-    "msg": "..."  // apenas para texto
-}
-```
-
-### Roteamento Inter-Broker
-```json
-{
-    "tipo": "frame",
-    "stream": "video",
-    "sala": "geral",
-    "usuario": "joão",
-    "broker_origem": "broker1",  // Marca origem para evitar loops
-    "timestamp": 1234567890.123
-}
-```
-
-## Service Discovery (Heartbeat)
-
-**Intervalo**: 2 segundos
-**Timeout**: 6 segundos (3 heartbeats perdidos)
-
-Formato do heartbeat UDP:
-```json
-{
-    "broker_id": "broker1",
-    "port": 5500,
-    "timestamp": "2026-04-22T10:30:45.123456"
-}
-```
-
-## Vantagens da Arquitetura
-
-✅ **Escalabilidade**: Adicione brokers dinamicamente
-✅ **Resiliência**: Brokers descobrem uns aos outros automaticamente
-✅ **Distribuição de Carga**: ROUTER-DEALER com load balancing
-✅ **Prevenção de Loops**: Marca origem das mensagens
-✅ **Gerenciamento de Grupos**: Cada broker gerencia subconjunto de salas
-✅ **Broadcast Eficiente**: PUB-SUB para dados em tempo real
+- login simples com `user_id` unico
+- entrada em sala no login
+- troca de sala em runtime (`/join salaX`)
+- consulta de presenca (`/who`)
 
 ## Requisitos
 
 - Python 3.8+
-- ZMQ (pyzmq)
-- OpenCV (cv2)
-- Tkinter
-- PIL/Pillow
-- PyAudio (opcional, para áudio)
+- pyzmq
+- numpy
+- opencv-python
+- pillow
+- pyaudio (opcional para audio)
 
-## Instalação
+Instalar dependencias:
 
 ```bash
-pip install pyzmq opencv-python pillow
-# Opcional: pip install pyaudio
+pip install -r requirements.txt
 ```
+
+## Execucao
+
+### 1) Iniciar brokers
+
+Exemplo com 3 brokers:
+
+```bash
+python broker.py broker1 5500
+python broker.py broker2 5600
+python broker.py broker3 5700
+```
+
+### 2) Iniciar clientes
+
+```bash
+python client.py
+```
+
+No login, escolha:
+
+- `user_id`
+- sala inicial
+- estrategia de selecao de broker
+
+## Comandos no chat
+
+- enviar mensagem: texto normal
+- trocar sala: `/join nome_da_sala`
+- listar presenca local/salas: `/who`
+
+## Mapeamento para os requisitos do enunciado
+
+1. Arquitetura distribuida com multiplos brokers: implementado em `broker.py` com descoberta + malha inter-broker
+2. Service discovery: heartbeats UDP + selecao de broker no cliente
+3. Tolerancia a falhas: ping + timeout + failover automatico
+4. QoS simplificado: retry texto, drop audio, adaptacao e drop video
+5. Concorrencia e processamento assincrono: threads dedicadas por etapa
+6. Identidade e sessao: login unico, presenca, entrada/saida de salas
+
+## Observacoes
+
+- Audio exige `PyAudio`; sem ele o cliente funciona com video/texto.
+- Em redes locais restritas, broadcast UDP pode ser bloqueado; para teste local, execute tudo no mesmo host.
