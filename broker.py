@@ -1,319 +1,642 @@
-import zmq
-import threading
-import time
 import json
 import socket
 import sys
-from collections import defaultdict
-from datetime import datetime, timedelta
+import threading
+import time
+import uuid
+from collections import defaultdict, deque
+from datetime import datetime, timezone
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURAÇÃO
-# ─────────────────────────────────────────────────────────────────────────────
+import zmq
+
 
 class BrokerConfig:
-    def __init__(self, broker_id, primary_port):
+    def __init__(self, broker_id: str, primary_port: int):
         self.broker_id = broker_id
         self.primary_port = primary_port
-        
-        # Portas relativas ao primary_port
-        self.router_video = primary_port + 1
-        self.dealer_video = primary_port + 2
-        self.pubsub_video_pub = primary_port + 3
-        self.pubsub_video_sub = primary_port + 4
-        
-        self.router_audio = primary_port + 11
-        self.dealer_audio = primary_port + 12
-        self.pubsub_audio_pub = primary_port + 13
-        self.pubsub_audio_sub = primary_port + 14
-        
-        self.router_texto = primary_port + 21
-        self.dealer_texto = primary_port + 22
-        self.pubsub_texto_pub = primary_port + 23
-        self.pubsub_texto_sub = primary_port + 24
-        
-        # Service Discovery
-        self.discovery_port = 6000  # porta fixa para discovery
-        self.heartbeat_interval = 2  # segundos
-        self.heartbeat_timeout = 6  # segundos
 
+        # Client media channels (publishers send to *_pub_in, subscribers read from *_sub_out)
+        self.video_pub_in = primary_port + 3
+        self.video_sub_out = primary_port + 4
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BROKER COM SERVICE DISCOVERY
-# ─────────────────────────────────────────────────────────────────────────────
+        self.audio_pub_in = primary_port + 13
+        self.audio_sub_out = primary_port + 14
 
-class MultiBroker:
-    def __init__(self, broker_id, primary_port):
-        self.config = BrokerConfig(broker_id, primary_port)
-        self.ctx = zmq.Context()
-        
-        # Descoberta de outros brokers
-        self.other_brokers = {}  # {broker_id: {"port": X, "timestamp": T}}
-        self.lock_brokers = threading.Lock()
-        
-        # Gerenciamento de grupos/salas locais
-        self.local_groups = defaultdict(list)  # {sala: [usuarios]}
-        self.lock_groups = threading.Lock()
-        
-        # Socket para comunicação entre brokers (REQ-REP)
-        self.broker_req = None
-        self.broker_rep = None
-        
-        print(f"\n✓ Broker {self.config.broker_id} inicializado")
-        print(f"  Port primária: {self.config.primary_port}")
-    
-    def start(self):
-        """Inicia todos os threads do broker"""
+        self.text_pub_in = primary_port + 23
+        self.text_sub_out = primary_port + 24
+
+        # Control-plane endpoints
+        self.control_port = primary_port + 200
+        self.mesh_port = primary_port + 300
+
         # Service discovery
+        self.discovery_port = 6000
+        self.heartbeat_interval = 2
+        self.heartbeat_timeout = 8
+
+        # Mesh relay loop prevention
+        self.relay_ttl = 4
+        self.seen_ttl_seconds = 60
+
+
+class DistributedBroker:
+    def __init__(self, broker_id: str, primary_port: int):
+        self.config = BrokerConfig(broker_id, primary_port)
+        self.ctx = zmq.Context.instance()
+        self.stop_event = threading.Event()
+
+        # Service discovery state
+        self.known_brokers = {}  # broker_id -> {host, primary_port, mesh_port, control_port, ts}
+        self.connected_mesh_endpoints = set()
+        self.discovery_lock = threading.Lock()
+
+        # Presence/session state
+        self.local_users = {}  # user_id -> {room, last_seen}
+        self.local_rooms = defaultdict(set)  # room -> set(user_id)
+        self.remote_presence = {}  # broker_id -> {users, rooms, ts}
+        self.session_lock = threading.Lock()
+
+        # Text QoS buffer
+        self.text_history = defaultdict(lambda: deque(maxlen=500))
+
+        # Relay de-dup cache
+        self.seen_messages = {}  # msg_id -> unix_ts
+        self.seen_lock = threading.Lock()
+
+        # Mesh sockets managed across threads
+        self.mesh_pub = None
+        self.mesh_sub_sockets = []
+        self.mesh_sub_lock = threading.Lock()
+
+        # Local injection PUB for text reliability path
+        self.text_inject_pub = None
+
+        print(f"\n[Broker {self.config.broker_id}] init primary={self.config.primary_port}")
+
+    def _bind_random_port(self, sock):
+        return sock.bind_to_random_port("tcp://*")
+
+    def _ports_ready(self):
+        defaults = {
+            "video_pub_in": self.config.primary_port + 3,
+            "video_sub_out": self.config.primary_port + 4,
+            "audio_pub_in": self.config.primary_port + 13,
+            "audio_sub_out": self.config.primary_port + 14,
+            "text_pub_in": self.config.primary_port + 23,
+            "text_sub_out": self.config.primary_port + 24,
+            "control_port": self.config.primary_port + 200,
+        }
+        return all(getattr(self.config, name) != value for name, value in defaults.items())
+
+    def start(self):
+        self.mesh_pub = self.ctx.socket(zmq.PUB)
+        self.config.mesh_port = self._bind_random_port(self.mesh_pub)
+
+        threading.Thread(
+            target=self._media_channel_worker,
+            args=("video", self.config.video_pub_in, self.config.video_sub_out),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=self._media_channel_worker,
+            args=("audio", self.config.audio_pub_in, self.config.audio_sub_out),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=self._media_channel_worker,
+            args=("texto", self.config.text_pub_in, self.config.text_sub_out),
+            daemon=True,
+        ).start()
+
+        threading.Thread(target=self._control_server, daemon=True).start()
+
+        for _ in range(50):
+            if self._ports_ready():
+                break
+            time.sleep(0.1)
+
         threading.Thread(target=self._heartbeat_sender, daemon=True).start()
         threading.Thread(target=self._heartbeat_receiver, daemon=True).start()
         threading.Thread(target=self._heartbeat_cleanup, daemon=True).start()
-        
-        # Proxy ROUTER-DEALER para canais (bloqueia, por isso em threads separadas)
-        threading.Thread(target=self._proxy_router_dealer, args=("VIDEO",), daemon=True).start()
-        threading.Thread(target=self._proxy_router_dealer, args=("AUDIO",), daemon=True).start()
-        threading.Thread(target=self._proxy_router_dealer, args=("TEXTO",), daemon=True).start()
-        
-        # Proxy PUB-SUB para cada canal (em threads separadas)
-        threading.Thread(target=self._proxy_pubsub, args=("VIDEO",), daemon=True).start()
-        threading.Thread(target=self._proxy_pubsub, args=("AUDIO",), daemon=True).start()
-        threading.Thread(target=self._proxy_pubsub, args=("TEXTO",), daemon=True).start()
-        
-        # Servidor de roteamento entre brokers
-        threading.Thread(target=self._broker_router_server, daemon=True).start()
-        
-        print(f"  [✓] Service discovery ativo (UDP:{self.config.discovery_port})")
-        print(f"  [✓] Proxies ROUTER-DEALER ativas")
-        print(f"  [✓] Proxies PUB-SUB ativas")
-        print(f"  [✓] Servidor de roteamento entre brokers ativo\n")
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # SERVICE DISCOVERY (UDP Heartbeat)
-    # ─────────────────────────────────────────────────────────────────────────
-    
+        threading.Thread(target=self._mesh_connection_manager, daemon=True).start()
+        threading.Thread(target=self._seen_cache_cleanup, daemon=True).start()
+
+        threading.Thread(target=self._presence_sender, daemon=True).start()
+        threading.Thread(target=self._presence_receiver, daemon=True).start()
+
+        # Small delay to allow XSUB bind before local injection PUB connect.
+        time.sleep(0.2)
+        self.text_inject_pub = self.ctx.socket(zmq.PUB)
+        self.text_inject_pub.connect(f"tcp://127.0.0.1:{self.config.text_pub_in}")
+
+        print(f"[Broker {self.config.broker_id}] discovery UDP={self.config.discovery_port}")
+        print(f"[Broker {self.config.broker_id}] control REP={self.config.control_port}")
+        print(f"[Broker {self.config.broker_id}] mesh PUB={self.config.mesh_port}")
+        print(
+            f"[Broker {self.config.broker_id}] channels video({self.config.video_pub_in}->{self.config.video_sub_out}) "
+            f"audio({self.config.audio_pub_in}->{self.config.audio_sub_out}) "
+            f"texto({self.config.text_pub_in}->{self.config.text_sub_out})"
+        )
+
+    # ---------------------------------------------------------------------
+    # Service discovery
+    # ---------------------------------------------------------------------
+
     def _heartbeat_sender(self):
-        """Envia heartbeat UDP para descoberta"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        
-        while True:
-            time.sleep(self.config.heartbeat_interval)
-            
-            heartbeat = json.dumps({
-                "broker_id": self.config.broker_id,
-                "port": self.config.primary_port,
-                "timestamp": datetime.now().isoformat()
-            }).encode()
-            
+
+        while not self.stop_event.is_set():
+            payload = json.dumps(
+                {
+                    "broker_id": self.config.broker_id,
+                    "primary_port": self.config.primary_port,
+                    "mesh_port": self.config.mesh_port,
+                    "control_port": self.config.control_port,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            ).encode("utf-8")
+
             try:
-                sock.sendto(heartbeat, ("255.255.255.255", self.config.discovery_port))
+                sock.sendto(payload, ("255.255.255.255", self.config.discovery_port))
             except OSError:
-                # Em caso de erro, tenta envio unicast também para localhost
-                sock.sendto(heartbeat, ("127.0.0.1", self.config.discovery_port))
-    
+                sock.sendto(payload, ("127.0.0.1", self.config.discovery_port))
+
+            time.sleep(self.config.heartbeat_interval)
+
     def _heartbeat_receiver(self):
-        """Recebe heartbeats UDP de outros brokers"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("0.0.0.0", self.config.discovery_port))
         sock.settimeout(1)
-        
-        while True:
+
+        while not self.stop_event.is_set():
             try:
-                data, addr = sock.recvfrom(1024)
-                msg = json.loads(data.decode())
-                
-                # Ignora seu próprio heartbeat
-                if msg["broker_id"] != self.config.broker_id:
-                    with self.lock_brokers:
-                        self.other_brokers[msg["broker_id"]] = {
-                            "port": msg["port"],
-                            "timestamp": datetime.now()
-                        }
-                        print(f"  [Discovery] Broker {msg['broker_id']} detectado em porta {msg['port']}")
+                data, addr = sock.recvfrom(4096)
+                msg = json.loads(data.decode("utf-8"))
+                broker_id = msg.get("broker_id")
+                if not broker_id or broker_id == self.config.broker_id:
+                    continue
+
+                with self.discovery_lock:
+                    first_seen = broker_id not in self.known_brokers
+                    self.known_brokers[broker_id] = {
+                        "host": addr[0],
+                        "primary_port": int(msg.get("primary_port")),
+                        "mesh_port": int(msg.get("mesh_port")),
+                        "control_port": int(msg.get("control_port")),
+                        "ts": time.time(),
+                    }
+
+                if first_seen:
+                    print(
+                        f"[Discovery] broker={broker_id} host={addr[0]} mesh={msg.get('mesh_port')}"
+                    )
             except socket.timeout:
                 pass
-            except Exception as e:
+            except Exception:
                 pass
-    
+
     def _heartbeat_cleanup(self):
-        """Remove brokers que não enviam heartbeat"""
-        while True:
+        while not self.stop_event.is_set():
             time.sleep(1)
-            now = datetime.now()
-            
-            with self.lock_brokers:
-                dead_brokers = []
-                for broker_id, info in list(self.other_brokers.items()):
-                    if (now - info["timestamp"]).total_seconds() > self.config.heartbeat_timeout:
-                        dead_brokers.append(broker_id)
-                
-                for broker_id in dead_brokers:
-                    del self.other_brokers[broker_id]
-                    print(f"  [Cleanup] Broker {broker_id} removido (timeout)")
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # PROXY ROUTER-DEALER COM ROTEAMENTO ENTRE BROKERS
-    # ─────────────────────────────────────────────────────────────────────────
-    
-    def _proxy_router_dealer(self, channel):
-        """Proxy ROUTER-DEALER para requisição-resposta"""
-        if channel == "VIDEO":
-            porta_router = self.config.router_video
-            porta_dealer = self.config.dealer_video
-        elif channel == "AUDIO":
-            porta_router = self.config.router_audio
-            porta_dealer = self.config.dealer_audio
-        else:  # TEXTO
-            porta_router = self.config.router_texto
-            porta_dealer = self.config.dealer_texto
-        
-        # Frontend: ROUTER recebe de clientes
-        frontend = self.ctx.socket(zmq.ROUTER)
-        frontend.bind(f"tcp://*:{porta_router}")
-        
-        # Backend: DEALER distribui para workers
-        backend = self.ctx.socket(zmq.DEALER)
-        backend.bind(f"tcp://*:{porta_dealer}")
-        
-        print(f"  [{channel} REQ-REP] ROUTER={porta_router} DEALER={porta_dealer}")
-        
-        # Proxy padrão entre ROUTER-DEALER
-        zmq.proxy(frontend, backend)
-    
-    def _proxy_pubsub(self, channel):
-        """Proxy PUB-SUB para broadcast"""
-        if channel == "VIDEO":
-            porta_pubsub_pub = self.config.pubsub_video_pub
-            porta_pubsub_sub = self.config.pubsub_video_sub
-        elif channel == "AUDIO":
-            porta_pubsub_pub = self.config.pubsub_audio_pub
-            porta_pubsub_sub = self.config.pubsub_audio_sub
-        else:  # TEXTO
-            porta_pubsub_pub = self.config.pubsub_texto_pub
-            porta_pubsub_sub = self.config.pubsub_texto_sub
-        
-        # XSUB recebe PUB
-        sub_input = self.ctx.socket(zmq.XSUB)
-        sub_input.bind(f"tcp://*:{porta_pubsub_pub}")
-        
-        # XPUB publica SUB
-        pub_output = self.ctx.socket(zmq.XPUB)
-        pub_output.bind(f"tcp://*:{porta_pubsub_sub}")
-        pub_output.setsockopt(zmq.XPUB_VERBOSE, 1)
-        
-        print(f"  [{channel} PUB-SUB] PUB={porta_pubsub_pub} SUB={porta_pubsub_sub}")
-        
-        # Proxy PUB-SUB
-        zmq.proxy(sub_input, pub_output)
-    
-    def _broker_router_server(self):
-        """Servidor para receber mensagens de brokers vizinhos"""
-        sock = self.ctx.socket(zmq.REP)
-        sock.bind(f"tcp://*:{self.config.primary_port + 100}")
-        
-        while True:
-            try:
-                msg = sock.recv_json()
-                
-                # Processa mensagem inter-broker
-                resposta = self._processar_mensagem_inter_broker(msg)
-                sock.send_json(resposta)
-            except Exception as e:
-                pass
-    
-    def _processar_mensagem_inter_broker(self, msg):
-        """Processa mensagem vinda de outro broker"""
-        msg_type = msg.get("tipo")
-        sala = msg.get("sala")
-        usuario = msg.get("usuario")
-        origem_broker = msg.get("origem_broker")
-        visitados = msg.get("visitados", [])
-        
-        # Evita loops: se mensagem já veio daqui, bloqueia
-        if self.config.broker_id in visitados:
-            return {"status": "bloqueado", "motivo": "loop_detectado"}
-        
-        # Se a sala é gerenciada localmente, roteia para os usuários
-        with self.lock_groups:
-            usuarios_sala = self.local_groups.get(sala, [])
-        
-        if usuarios_sala:
-            # Há usuários desta sala aqui - entreg local
-            return {"status": "roteado_local", "usuarios": usuarios_sala, "count": len(usuarios_sala)}
-        
-        # Marca que passou por aqui e roteia para outros brokers
-        visitados_novos = visitados + [self.config.broker_id]
-        msg_novo = dict(msg)
-        msg_novo["visitados"] = visitados_novos
-        
-        # Roteia para brokers vizinhos (exceto onde veio e já visitados)
-        self._rotear_para_brokers_vizinhos(msg_novo)
-        return {"status": "reencaminhado", "para_brokers": len(self.other_brokers)}
-    
-    def _rotear_para_brokers_vizinhos(self, msg):
-        """Envia mensagem para brokers vizinhos (exceto origem e visitados)"""
-        visitados = msg.get("visitados", [])
-        
-        with self.lock_brokers:
-            brokers = [
-                (bid, info) for bid, info in self.other_brokers.items()
-                if bid not in visitados
-            ]
-        
-        for broker_id, info in brokers:
-            try:
-                cliente = self.ctx.socket(zmq.REQ)
-                cliente.connect(f"tcp://localhost:{info['port'] + 100}")
-                cliente.setsockopt(zmq.RCVTIMEO, 500)  # Mais rápido
-                
-                cliente.send_json(msg)
-                cliente.recv_json()
-                cliente.close()
-            except Exception as e:
-                pass
-    
-    def registrar_usuario(self, sala, usuario):
-        """Registra usuário em uma sala (gerenciada localmente)"""
-        with self.lock_groups:
-            if usuario not in self.local_groups[sala]:
-                self.local_groups[sala].append(usuario)
-                print(f"  [Grupo] {usuario} entrou em {sala}")
-    
-    def remover_usuario(self, sala, usuario):
-        """Remove usuário de uma sala"""
-        with self.lock_groups:
-            if sala in self.local_groups and usuario in self.local_groups[sala]:
-                self.local_groups[sala].remove(usuario)
-                print(f"  [Grupo] {usuario} saiu de {sala}")
+            now = time.time()
+            dead = []
 
+            with self.discovery_lock:
+                for broker_id, info in self.known_brokers.items():
+                    if now - info["ts"] > self.config.heartbeat_timeout:
+                        dead.append(broker_id)
+                for broker_id in dead:
+                    del self.known_brokers[broker_id]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+            if dead:
+                for broker_id in dead:
+                    print(f"[Discovery] broker={broker_id} timeout")
+
+    def _mesh_connection_manager(self):
+        while not self.stop_event.is_set():
+            with self.discovery_lock:
+                brokers_snapshot = dict(self.known_brokers)
+
+            for broker_id, info in brokers_snapshot.items():
+                endpoint = f"tcp://{info['host']}:{info['mesh_port']}"
+                if endpoint in self.connected_mesh_endpoints:
+                    continue
+
+                with self.mesh_sub_lock:
+                    for sock in self.mesh_sub_sockets:
+                        try:
+                            sock.connect(endpoint)
+                        except Exception:
+                            pass
+                self.connected_mesh_endpoints.add(endpoint)
+                print(f"[Mesh] connected to broker={broker_id} endpoint={endpoint}")
+
+            time.sleep(1)
+
+    # ---------------------------------------------------------------------
+    # Presence and session
+    # ---------------------------------------------------------------------
+
+    def _presence_sender(self):
+        while not self.stop_event.is_set():
+            snapshot = self._build_local_presence_snapshot()
+            try:
+                self.mesh_pub.send_multipart(
+                    [
+                        b"presence|snapshot",
+                        json.dumps(
+                            {
+                                "broker_id": self.config.broker_id,
+                                "snapshot": snapshot,
+                                "ts": time.time(),
+                            }
+                        ).encode("utf-8"),
+                    ]
+                )
+            except Exception:
+                pass
+            time.sleep(3)
+
+    def _presence_receiver(self):
+        sub = self.ctx.socket(zmq.SUB)
+        sub.setsockopt(zmq.SUBSCRIBE, b"presence|")
+        sub.setsockopt(zmq.RCVTIMEO, 1000)
+
+        with self.mesh_sub_lock:
+            self.mesh_sub_sockets.append(sub)
+            for endpoint in self.connected_mesh_endpoints:
+                try:
+                    sub.connect(endpoint)
+                except Exception:
+                    pass
+
+        while not self.stop_event.is_set():
+            try:
+                topic, payload = sub.recv_multipart()
+                msg = json.loads(payload.decode("utf-8"))
+                broker_id = msg.get("broker_id")
+                if not broker_id or broker_id == self.config.broker_id:
+                    continue
+
+                with self.session_lock:
+                    self.remote_presence[broker_id] = {
+                        "users": msg.get("snapshot", {}).get("users", []),
+                        "rooms": msg.get("snapshot", {}).get("rooms", {}),
+                        "ts": time.time(),
+                    }
+            except zmq.error.Again:
+                pass
+            except Exception:
+                pass
+
+    def _build_local_presence_snapshot(self):
+        with self.session_lock:
+            users = sorted(self.local_users.keys())
+            rooms = {room: len(users_set) for room, users_set in self.local_rooms.items()}
+        return {"users": users, "rooms": rooms}
+
+    def _is_user_taken(self, user_id: str) -> bool:
+        with self.session_lock:
+            if user_id in self.local_users:
+                return True
+            for remote in self.remote_presence.values():
+                if user_id in remote.get("users", []):
+                    return True
+        return False
+
+    # ---------------------------------------------------------------------
+    # Channel workers: XSUB/XPUB + inter-broker relay
+    # ---------------------------------------------------------------------
+
+    def _media_channel_worker(self, stream: str, pub_in_port: int, sub_out_port: int):
+        xsub = self.ctx.socket(zmq.XSUB)
+        pub_in_port = self._bind_random_port(xsub)
+
+        xpub = self.ctx.socket(zmq.XPUB)
+        sub_out_port = self._bind_random_port(xpub)
+        xpub.setsockopt(zmq.XPUB_VERBOSE, 1)
+
+        if stream == "video":
+            self.config.video_pub_in = pub_in_port
+            self.config.video_sub_out = sub_out_port
+        elif stream == "audio":
+            self.config.audio_pub_in = pub_in_port
+            self.config.audio_sub_out = sub_out_port
+        else:
+            self.config.text_pub_in = pub_in_port
+            self.config.text_sub_out = sub_out_port
+
+        mesh_sub = self.ctx.socket(zmq.SUB)
+        mesh_sub.setsockopt(zmq.SUBSCRIBE, f"relay|{stream}|".encode("utf-8"))
+        mesh_sub.setsockopt(zmq.RCVTIMEO, 500)
+
+        with self.mesh_sub_lock:
+            self.mesh_sub_sockets.append(mesh_sub)
+            for endpoint in self.connected_mesh_endpoints:
+                try:
+                    mesh_sub.connect(endpoint)
+                except Exception:
+                    pass
+
+        poller = zmq.Poller()
+        poller.register(xsub, zmq.POLLIN)
+        poller.register(xpub, zmq.POLLIN)
+        poller.register(mesh_sub, zmq.POLLIN)
+
+        print(f"[Channel {stream}] XSUB={pub_in_port} XPUB={sub_out_port}")
+
+        while not self.stop_event.is_set():
+            try:
+                events = dict(poller.poll(500))
+            except Exception:
+                continue
+
+            # Local publisher -> local subscribers and mesh relay.
+            if xsub in events and events[xsub] == zmq.POLLIN:
+                try:
+                    parts = xsub.recv_multipart()
+                    if len(parts) < 2:
+                        continue
+                    topic = parts[0]
+                    payload = parts[1]
+
+                    xpub.send_multipart([topic, payload])
+
+                    msg_meta = self._build_relay_meta(topic, stream)
+                    relay_topic = f"relay|{stream}|".encode("utf-8")
+                    self.mesh_pub.send_multipart(
+                        [relay_topic, topic, payload, json.dumps(msg_meta).encode("utf-8")]
+                    )
+                except Exception:
+                    pass
+
+            # Forward topic subscriptions from local subscribers to publishers.
+            # This is required for XSUB to receive topic-filtered data.
+            if xpub in events and events[xpub] == zmq.POLLIN:
+                try:
+                    subscription_frame = xpub.recv()
+                    xsub.send(subscription_frame)
+                except Exception:
+                    pass
+
+            # Mesh relay -> local subscribers and optional re-forward.
+            if mesh_sub in events and events[mesh_sub] == zmq.POLLIN:
+                try:
+                    relay_topic, topic, payload, meta_raw = mesh_sub.recv_multipart()
+                    del relay_topic
+                    meta = json.loads(meta_raw.decode("utf-8"))
+                    msg_id = meta.get("msg_id")
+                    if not msg_id:
+                        continue
+
+                    if self._is_seen(msg_id):
+                        continue
+                    self._mark_seen(msg_id)
+
+                    xpub.send_multipart([topic, payload])
+
+                    ttl = int(meta.get("ttl", 0))
+                    if ttl > 0 and meta.get("origin_broker") != self.config.broker_id:
+                        meta["ttl"] = ttl - 1
+                        self.mesh_pub.send_multipart(
+                            [
+                                f"relay|{stream}|".encode("utf-8"),
+                                topic,
+                                payload,
+                                json.dumps(meta).encode("utf-8"),
+                            ]
+                        )
+                except Exception:
+                    pass
+
+    def _build_relay_meta(self, topic: bytes, stream: str):
+        msg_id = str(uuid.uuid4())
+        room, user = self._parse_topic(topic, stream)
+
+        meta = {
+            "msg_id": msg_id,
+            "origin_broker": self.config.broker_id,
+            "ttl": self.config.relay_ttl,
+            "room": room,
+            "user": user,
+            "stream": stream,
+            "ts": time.time(),
+        }
+        self._mark_seen(msg_id)
+        return meta
+
+    @staticmethod
+    def _parse_topic(topic: bytes, stream: str):
+        try:
+            text = topic.decode("utf-8")
+            # topic format: <stream>:<room>:<user>
+            parts = text.split(":", 2)
+            if len(parts) == 3 and parts[0] == stream:
+                return parts[1], parts[2]
+        except Exception:
+            pass
+        return "", ""
+
+    def _is_seen(self, msg_id: str) -> bool:
+        with self.seen_lock:
+            return msg_id in self.seen_messages
+
+    def _mark_seen(self, msg_id: str):
+        with self.seen_lock:
+            self.seen_messages[msg_id] = time.time()
+
+    def _seen_cache_cleanup(self):
+        while not self.stop_event.is_set():
+            time.sleep(5)
+            now = time.time()
+            with self.seen_lock:
+                dead = [
+                    mid
+                    for mid, ts in self.seen_messages.items()
+                    if now - ts > self.config.seen_ttl_seconds
+                ]
+                for mid in dead:
+                    del self.seen_messages[mid]
+
+    # ---------------------------------------------------------------------
+    # Control plane (login/join/leave/presence/text qos)
+    # ---------------------------------------------------------------------
+
+    def _control_server(self):
+        rep = self.ctx.socket(zmq.REP)
+        self.config.control_port = self._bind_random_port(rep)
+
+        print(f"[Control] REP={self.config.control_port}")
+
+        while not self.stop_event.is_set():
+            try:
+                req = rep.recv_json()
+                resp = self._handle_control_request(req)
+                rep.send_json(resp)
+            except Exception:
+                try:
+                    rep.send_json({"ok": False, "error": "internal_error"})
+                except Exception:
+                    pass
+
+    def _handle_control_request(self, req: dict):
+        action = req.get("action")
+
+        if action == "ping":
+            return {"ok": True, "broker_id": self.config.broker_id, "ts": time.time()}
+
+        if action == "login":
+            user_id = (req.get("user_id") or "").strip()
+            room = (req.get("room") or "geral").strip().lower()
+            if not user_id:
+                return {"ok": False, "error": "invalid_user_id"}
+            if self._is_user_taken(user_id):
+                return {"ok": False, "error": "user_id_in_use"}
+
+            with self.session_lock:
+                self.local_users[user_id] = {"room": room, "last_seen": time.time()}
+                self.local_rooms[room].add(user_id)
+
+            return {
+                "ok": True,
+                "broker_id": self.config.broker_id,
+                "room": room,
+                "ports": {
+                    "video_pub_in": self.config.video_pub_in,
+                    "video_sub_out": self.config.video_sub_out,
+                    "audio_pub_in": self.config.audio_pub_in,
+                    "audio_sub_out": self.config.audio_sub_out,
+                    "text_pub_in": self.config.text_pub_in,
+                    "text_sub_out": self.config.text_sub_out,
+                    "control_port": self.config.control_port,
+                },
+            }
+
+        if action == "heartbeat_user":
+            user_id = (req.get("user_id") or "").strip()
+            if not user_id:
+                return {"ok": False, "error": "invalid_user_id"}
+            with self.session_lock:
+                if user_id in self.local_users:
+                    self.local_users[user_id]["last_seen"] = time.time()
+            return {"ok": True}
+
+        if action == "join_room":
+            user_id = (req.get("user_id") or "").strip()
+            new_room = (req.get("room") or "").strip().lower()
+            if not user_id or not new_room:
+                return {"ok": False, "error": "invalid_parameters"}
+
+            with self.session_lock:
+                user = self.local_users.get(user_id)
+                if not user:
+                    return {"ok": False, "error": "user_not_logged"}
+                old_room = user["room"]
+                if old_room in self.local_rooms:
+                    self.local_rooms[old_room].discard(user_id)
+                self.local_rooms[new_room].add(user_id)
+                user["room"] = new_room
+                user["last_seen"] = time.time()
+
+            return {"ok": True, "room": new_room}
+
+        if action == "leave":
+            user_id = (req.get("user_id") or "").strip()
+            if not user_id:
+                return {"ok": False, "error": "invalid_user_id"}
+
+            with self.session_lock:
+                user = self.local_users.pop(user_id, None)
+                if user:
+                    room = user["room"]
+                    self.local_rooms[room].discard(user_id)
+                    if not self.local_rooms[room]:
+                        del self.local_rooms[room]
+
+            return {"ok": True}
+
+        if action == "presence":
+            with self.session_lock:
+                local_users = sorted(self.local_users.keys())
+                local_rooms = {
+                    room: sorted(list(users)) for room, users in self.local_rooms.items()
+                }
+                remote = dict(self.remote_presence)
+
+            aggregated_rooms = defaultdict(set)
+            for room, users in local_rooms.items():
+                for user in users:
+                    aggregated_rooms[room].add(user)
+            for broker_data in remote.values():
+                for user in broker_data.get("users", []):
+                    # user->room mapping is not guaranteed from snapshot; keep online view.
+                    pass
+
+            return {
+                "ok": True,
+                "broker_id": self.config.broker_id,
+                "online_local": local_users,
+                "rooms_local": local_rooms,
+                "remote_presence": remote,
+                "rooms_aggregated": {
+                    room: sorted(list(users)) for room, users in aggregated_rooms.items()
+                },
+            }
+
+        if action == "send_text":
+            user_id = (req.get("user_id") or "").strip()
+            room = (req.get("room") or "").strip().lower()
+            text = (req.get("text") or "").strip()
+            text_id = (req.get("text_id") or "").strip()
+            if not user_id or not room or not text or not text_id:
+                return {"ok": False, "error": "invalid_parameters"}
+
+            with self.session_lock:
+                if user_id not in self.local_users:
+                    return {"ok": False, "error": "user_not_logged"}
+
+            payload = {
+                "id": text_id,
+                "de": user_id,
+                "msg": text,
+                "room": room,
+                "ts": time.time(),
+            }
+            raw = json.dumps(payload).encode("utf-8")
+            topic = f"texto:{room}:{user_id}".encode("utf-8")
+
+            try:
+                self.text_inject_pub.send_multipart([topic, raw])
+                self.text_history[room].append(payload)
+                return {"ok": True, "text_id": text_id}
+            except Exception:
+                return {"ok": False, "error": "text_publish_failed"}
+
+        return {"ok": False, "error": "unknown_action"}
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Uso: python broker.py <broker_id> <primary_port>")
         print("Exemplo: python broker.py broker1 5500")
         sys.exit(1)
-    
+
     broker_id = sys.argv[1]
     try:
         primary_port = int(sys.argv[2])
     except ValueError:
-        print("Erro: primary_port deve ser um número inteiro")
+        print("Erro: primary_port deve ser inteiro")
         sys.exit(1)
-    
-    broker = MultiBroker(broker_id, primary_port)
+
+    broker = DistributedBroker(broker_id, primary_port)
     broker.start()
-    
-    print("Broker rodando. Ctrl+C para parar.")
+
+    print("Broker em execucao. Ctrl+C para encerrar.")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nBroker encerrado.")
-
-
+        print("Encerrando broker...")
