@@ -493,8 +493,8 @@ class DistributedBroker:
             room = (req.get("room") or "geral").strip().lower()
             if not user_id:
                 return {"ok": False, "error": "invalid_user_id"}
-            if self._is_user_taken(user_id):
-                return {"ok": False, "error": "user_id_in_use"}
+            # if self._is_user_taken(user_id):
+            #     return {"ok": False, "error": "user_id_in_use"}
 
             with self.session_lock:
                 self.local_users[user_id] = {"room": room, "last_seen": time.time()}
