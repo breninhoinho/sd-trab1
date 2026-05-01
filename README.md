@@ -1,146 +1,200 @@
-# VideoConf Distribuido com ZeroMQ
+# VideoConf Distribuído com ZeroMQ
 
-Projeto de videoconferencia (video, audio e texto) em Python3 com arquitetura distribuida baseada em ZeroMQ.
+![Status](https://img.shields.io/badge/status-completo-brightgreen) ![Python](https://img.shields.io/badge/python-3.8%2B-blue) ![ZeroMQ](https://img.shields.io/badge/zeromq-27.1.0-blue)
 
-## Objetivo da evolucao
+Ferramenta de videoconferência distribuída em Python 3 com suporte a **vídeo, áudio e texto** usando **ZeroMQ** como middleware de comunicação.
 
-Esta versao implementa:
+## Integrantes do Grupo
 
-- multiplos brokers cooperando
-- descoberta dinamica de brokers (service discovery)
-- tolerancia a falhas com failover automatico
-- QoS simplificado por tipo de midia
-- concorrencia com threads separadas
-- identidade, sessao, presenca e salas
+```
+1. Artur Kioshi de Almeida Nacafucasaco (802405)
+2. Breno Dias Arantes dos Santos (800577)
+3. Leonardo Shoji Ishiy
+4. Maykon dos Santos Gonçalves (821653)
+5. Renato Dias Ferreira Campos (821328)
+```
 
-## Arquitetura
+## Características
 
-### 1) Cluster de brokers
-
-Cada broker executa de forma independente e publica heartbeat por UDP.
-
-- descoberta: UDP porta `6000`
-- plano de dados cliente/broker por canal (XSUB/XPUB):
-  - video: `P+3` (pub_in), `P+4` (sub_out)
-  - audio: `P+13` (pub_in), `P+14` (sub_out)
-  - texto: `P+23` (pub_in), `P+24` (sub_out)
-- plano de controle (REQ/REP): `P+200`
-- malha inter-broker (PUB/SUB): `P+300`
-
-### 2) Roteamento inter-broker e anti-loop
-
-Mensagens de midia recebidas localmente sao:
-
-1. entregues aos assinantes locais
-2. reenviadas para outros brokers via malha
-
-Cada relay inclui metadados com:
-
-- `msg_id` unico
-- `origin_broker`
-- `ttl`
-
-Loop e duplicacao sao evitados por cache de mensagens ja vistas + TTL decremental.
-
-### 3) Service discovery
-
-Cliente nao precisa conhecer broker fixo.
-
-- brokers se anunciam por heartbeat UDP
-- cliente escolhe broker por:
-  - menor latencia
-  - round-robin
-
-### 4) Tolerancia a falhas
-
-Cliente possui monitor de heartbeat (ping no controle):
-
-- se broker falha por 3 tentativas consecutivas
-- cliente faz failover automatico para outro broker descoberto
-- sessao e sala sao restabelecidas no novo broker
-
-### 5) QoS simplificado
-
-- Texto (garantia de entrega): envio via plano de controle com `text_id` + retry ate 3 tentativas no cliente
-- Audio (baixa latencia): buffer pequeno com drop de chunks antigos quando fila enche
-- Video (taxa adaptativa): ajuste de qualidade JPEG conforme backlog e drop de frames antigos no buffer
-
-### 6) Concorrencia (threads)
-
-Cliente separa explicitamente:
-
-- captura de video
-- envio de video
-- recepcao de video
-- captura de audio
-- envio de audio
-- recepcao de audio
-- recepcao de texto
-- monitoramento de heartbeat/failover
-- renderizacao (loop UI)
-
-### 7) Identidade, sessao, presenca e salas
-
-- login simples com `user_id` unico
-- entrada em sala no login
-- troca de sala em runtime (`/join salaX`)
-- consulta de presenca (`/who`)
+- **Múltiplos Brokers Cooperando** - Cluster de brokers em malha (mesh)  
+- **Descoberta Automática** - Service discovery via UDP heartbeat  
+- **Tolerância a Falhas** - Failover automático entre brokers  
+- **QoS Adaptativo** - Diferentes estratégias por tipo de mídia  
+- **Concorrência** - 8+ threads para captura/envio/recepção  
+- **Salas de Chat** - Isolamento de grupos (geral, sala1, sala2, etc)  
+- **Presença Distribuída** - Consulta de usuários online em todos brokers  
+- **UI Desktop** - Interface com Tkinter (vídeo em grade 2x2 + chat)
 
 ## Requisitos
 
-- Python 3.8+
-- pyzmq
-- numpy
-- opencv-python
-- pillow
-- pyaudio (opcional para audio)
+- **Python 3.8+**
+- **pip** (gerenciador de pacotes)
+- Câmera USB (opcional para vídeo)
+- Microfone/Alto-falantes (opcional para áudio)
 
-Instalar dependencias:
+## Instalação Rápida
 
+### 1. Clonar/Preparar Repositório
+```bash
+cd sd-trab1
+```
+
+### 2. Criar Ambiente Virtual
+
+python -m venv venv
+source venv/bin/activate
+```
+
+### 3. Instalar Dependências
 ```bash
 pip install -r requirements.txt
 ```
 
-## Execucao
+## Início Rápido (Demo de 3 Brokers + 2 Clientes)
 
-### 1) Iniciar brokers
-
-Exemplo com 3 brokers:
-
+### Terminal 1 - Broker 1
 ```bash
 python broker.py broker1 5500
-python broker.py broker2 5600
-python broker.py broker3 5700
 ```
 
-### 2) Iniciar clientes
+### Terminal 2 - Broker 2
+```bash
+python broker.py broker2 5510
+```
 
+### Terminal 3 - Broker 3 (opcional)
+```bash
+python broker.py broker3 5520
+```
+
+### Terminal 4 - Cliente 1
 ```bash
 python client.py
+# Login UI: user1, sala=geral
 ```
 
-No login, escolha:
+### Terminal 5 - Cliente 2
+```bash
+python client.py
+# Login UI: user2, sala=geral
+```
 
-- `user_id`
-- sala inicial
-- estrategia de selecao de broker
+## Uso da Interface
 
-## Comandos no chat
+### Video
+- Grade 2x2 com seu próprio stream (canto superior esquerdo)
+- Até 3 videos remotos dos demais usuários na sala
+- Atualização automática a cada 50ms
 
-- enviar mensagem: texto normal
-- trocar sala: `/join nome_da_sala`
-- listar presenca local/salas: `/who`
+### Chat
+- Pane direita exibe últimas 30 mensagens
+- Digite mensagem e clique "Enviar" ou pressione Enter
 
-## Mapeamento para os requisitos do enunciado
+### Comandos
+| Comando | Descrição |
+|---------|-----------|
+| `/join salaA` | Trocar para sala A (ex: `/join sala1`) |
+| `/who` | Listar usuários online (local + remoto) |
+| Mensagem normal | Enviar texto para sala |
 
-1. Arquitetura distribuida com multiplos brokers: implementado em `broker.py` com descoberta + malha inter-broker
-2. Service discovery: heartbeats UDP + selecao de broker no cliente
-3. Tolerancia a falhas: ping + timeout + failover automatico
-4. QoS simplificado: retry texto, drop audio, adaptacao e drop video
-5. Concorrencia e processamento assincrono: threads dedicadas por etapa
-6. Identidade e sessao: login unico, presenca, entrada/saida de salas
+## Teste de Failover (Tolerância a Falhas)
 
-## Observacoes
+### Setup
+1. Inicie 2 brokers: `broker1 5500` e `broker2 5510`
+2. Conecte 1 cliente ao `broker1`
+3. Envie mensagens
 
-- Audio exige `PyAudio`; sem ele o cliente funciona com video/texto.
-- Em redes locais restritas, broadcast UDP pode ser bloqueado; para teste local, execute tudo no mesmo host.
+### Ativar Failover
+1. Finalize o `broker1` (Ctrl+C)
+2. Observe o cliente após ~6 segundos:
+   - Chat mostra: `[Failover] broker1 indisponivel. Procurando outro...`
+   - Chat mostra: `Failover para broker broker2`
+   - Cliente reconecta automaticamente
+
+
+## Arquitetura
+
+**Diagrama de Componentes:**
+
+```
+┌─ Broker Cluster ───────────────┐
+│  ┌─────────────┐                │
+│  │  Broker 1   │ ◄─mesh─►      │
+│  │   :5500     │                │
+│  ├─────────────┤                │
+│  │ Broker 2    │ ◄─mesh─►      │
+│  │   :5510     │                │
+│  ├─────────────┤                │
+│  │ Broker 3    │ ◄─mesh─►      │
+│  │   :5520     │                │
+│  └─────────────┘                │
+└────────────────────────────────┘
+   ▲         ▲          ▲
+   │         │          │
+   │    PUB/SUB     REQ/REP
+   │   (media)      (control)
+   │         │          │
+┌──┴──┐  ┌──┴──┐  ┌──┴──┐
+│ C1  │  │ C2  │  │ C3  │
+└─────┘  └─────┘  └─────┘
+```
+
+## Configuração Avançada
+
+### Trocar Estratégia de Seleção de Broker
+
+Na UI de login, escolha:
+- **"Menor latência"** (padrão): Seleciona broker com menor latência calculada via heartbeat
+- **"Round-robin"**: Distribui clientes uniformemente entre brokers
+
+### Múltiplos Brokers em Portas Customizadas
+
+```bash
+python broker.py brokerA 6000  # porta primária 6000
+python broker.py brokerB 6100  # porta primária 6100
+python broker.py brokerC 6200  # porta primária 6200
+```
+
+## Troubleshooting
+
+| Problema | Solução |
+|----------|---------|
+| "Nenhum broker encontrado" | Inicie pelo menos 1 broker antes de clientes |
+| Sem câmera | Video desativado automaticamente, funciona chat/áudio |
+| Sem áudio | PyAudio não instalado (opcional); video/chat funcionam |
+| Vídeo pixelado | Normal com internet lenta; qualidade adapta automaticamente |
+| Chat lento | Texto usa retry 3x; pode haver atraso se broker estiver ocupado |
+
+## Estrutura de Código
+
+### broker.py
+```
+DistributedBroker
+├── start()                       # Inicia todos os workers
+├── _media_channel_worker()       # XSUB/XPUB para video/audio/texto
+├── _control_server()             # REP para operações de controle
+├── _heartbeat_sender/receiver()  # Descoberta de brokers
+├── _mesh_connection_manager()    # Conecta à malha inter-broker
+├── _presence_sender/receiver()   # Publica/recebe presença distribuída
+└── _handle_control_request()     # Processa login/join/leave/send_text
+```
+
+### client.py
+```
+main()
+├── LoginUI.run()                 # Janela de login
+├── BrokerDiscovery               # Descobre brokers via UDP
+├── connect_to_best_broker()      # Login e seleção de broker
+├── heartbeat_monitor()           # Monitora saúde + failover
+├── start_workers()               # Inicia threads de media
+│   ├── video_capture_worker()    # Lê câmera
+│   ├── video_send_worker()       # Publica vídeo
+│   ├── video_recv_worker()       # Recebe vídeo
+│   ├── audio_capture_worker()    # Lê microfone (opcional)
+│   ├── audio_send_worker()       # Publica áudio (opcional)
+│   ├── audio_recv_worker()       # Reproduz áudio (opcional)
+│   └── text_recv_worker()        # Recebe texto
+├── build_ui()                    # UI Tkinter
+└── send_text_with_retry()        # Envia texto com 3 tentativas
+```
+
